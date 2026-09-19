@@ -4,6 +4,7 @@
 Testing strategies for Hypothesis-based tests.
 """
 
+import functools
 import keyword
 import string
 
@@ -12,6 +13,8 @@ from collections import OrderedDict
 from hypothesis import strategies as st
 
 import attr
+
+from attr._compat import PY_3_8_PLUS
 
 from .utils import make_class
 
@@ -117,7 +120,12 @@ list_of_attrs = st.lists(simple_attrs, max_size=3)
 
 @st.composite
 def simple_classes(
-    draw, slots=None, frozen=None, weakref_slot=None, private_attrs=None
+    draw,
+    slots=None,
+    frozen=None,
+    weakref_slot=None,
+    private_attrs=None,
+    cached_property=None,
 ):
     """
     A strategy that generates classes with default non-attr attributes.
@@ -140,6 +148,11 @@ def simple_classes(
     By default, some attributes will be private (i.e. prefixed with an
     underscore). If `private_attrs=True` is passed in, all attributes will be
     private, and if `private_attrs=False`, no attributes will be private.
+
+    By default, some combinations of classes will contain a cached_property
+    attribute or not. If `cached_property=True` is passed in, all classes
+    will contain a cached_property, and if `cached_property=False` is passed
+    in, no classes will contain a cached_property.
     """
     attrs = draw(list_of_attrs)
     frozen_flag = draw(st.booleans())
@@ -157,6 +170,7 @@ def simple_classes(
     pre_init_flag = draw(st.booleans())
     post_init_flag = draw(st.booleans())
     init_flag = draw(st.booleans())
+    cached_property_flag = draw(st.booleans())
 
     if pre_init_flag:
 
@@ -179,9 +193,22 @@ def simple_classes(
 
         cls_dict["__init__"] = init
 
+    bases = (object,)
+    if PY_3_8_PLUS and (
+        cached_property or (cached_property is None and cached_property_flag)
+    ):
+
+        class BaseWithCachedProperty:
+            @functools.cached_property
+            def _cached_property(self) -> int:
+                return 1
+
+        bases = (BaseWithCachedProperty,)
+
     return make_class(
         "HypClass",
         cls_dict,
+        bases=bases,
         slots=slots_flag if slots is None else slots,
         frozen=frozen_flag if frozen is None else frozen,
         weakref_slot=weakref_flag if weakref_slot is None else weakref_slot,

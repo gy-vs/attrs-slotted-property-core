@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import enum
+import functools
 import inspect
 import linecache
 import sys
@@ -16,6 +17,7 @@ from operator import itemgetter
 from . import _compat, _config, setters
 from ._compat import (
     PY310,
+    PY_3_8_PLUS,
     _AnnotationExtractor,
     get_generic_base,
 )
@@ -315,11 +317,11 @@ def _compile_and_eval(script, globs, locs=None, filename=""):
     eval(bytecode, globs, locs)
 
 
-def _make_method(name, script, filename, globs):
+def _make_method(name, script, filename, globs, locals=None):
     """
     Create the method with the script given and return the method object.
     """
-    locs = {}
+    locs = {} if locals is None else locals
 
     # In order of debuggers like PDB being able to step through the code,
     # we add a fake linecache entry.
@@ -597,6 +599,71 @@ def _transform_attrs(
     return _Attributes((AttrsClass(attrs), base_attrs, base_attr_map))
 
 
+def _make_cached_property_getattr(cached_properties, original_getattr, cls):
+    """
+    Create a ``__getattr__`` method that computes *cached_properties* on
+    first access and stores them in the equally-named slots.
+
+    *original_getattr* is a user-defined ``__getattr__`` that is called for
+    all other missing attributes; if it's None, the lookup is delegated to
+    the super classes (which may have their own ``__getattr__``).
+    """
+    lines = [
+        # Wrapped to get `__class__` into closure cell for super()
+        # (It will be replaced with the newly constructed class after
+        # construction).
+        "def wrapper(_cls):",
+        "    __class__ = _cls",
+        "    def __getattr__(self, item, cached_properties=cached_properties, original_getattr=original_getattr, _cached_setattr_get=_cached_setattr_get):",
+        "         func = cached_properties.get(item)",
+        "         if func is not None:",
+        "              result = func(self)",
+        "              _setter = _cached_setattr_get(self)",
+        "              _setter(item, result)",
+        "              return result",
+    ]
+    if original_getattr is not None:
+        lines.append(
+            "         return original_getattr(self, item)",
+        )
+    else:
+        lines.extend(
+            [
+                "         try:",
+                "             return super().__getattribute__(item)",
+                "         except AttributeError:",
+                "             if not hasattr(super(), '__getattr__'):",
+                "                 raise",
+                "             return super().__getattr__(item)",
+                "         original_error = f\"'{self.__class__.__name__}' object has no attribute '{item}'\"",
+                "         raise AttributeError(original_error)",
+            ]
+        )
+
+    lines.extend(
+        [
+            "    return __getattr__",
+            "__getattr__ = wrapper(_cls)",
+        ]
+    )
+
+    unique_filename = _generate_unique_filename(cls, "getattr")
+
+    glob = {
+        "cached_properties": cached_properties,
+        "_cached_setattr_get": _obj_setattr.__get__,
+        "original_getattr": original_getattr,
+    }
+
+    return _make_method(
+        "__getattr__",
+        "\n".join(lines),
+        unique_filename,
+        glob,
+        locals={"_cls": cls},
+    )
+
+
 def _frozen_setattrs(self, name, value):
     """
     Attached to frozen classes as __setattr__.
@@ -857,6 +924,94 @@ class _ClassBuilder:
         ):
             names += ("__weakref__",)
 
+        if PY_3_8_PLUS:
+            # `functools.cached_property` doesn't work on slotted classes
+            # out of the box, so cached properties are transformed into
+            # slots whose values are computed by a generated __getattr__.
+            #
+            # Look at the unfiltered class dict on purpose: a cached
+            # property whose name collides with an attrs attribute is
+            # filtered out of cd and the conflict would go unnoticed.
+            cached_properties = {
+                name: cached_property.func
+                for name, cached_property in self._cls_dict.items()
+                if isinstance(cached_property, functools.cached_property)
+            }
+
+            # Also take cached properties into account that are defined on
+            # base classes that attrs hasn't transformed (e.g. non-attrs
+            # bases).  Names that are defined closer to this class take
+            # precedence, mirroring regular attribute lookup.
+            seen = set(self._cls_dict) | set(self._attr_names)
+            for base_cls in self._cls.__mro__[1:-1]:
+                for name, value in base_cls.__dict__.items():
+                    if name in seen:
+                        continue
+                    if isinstance(value, functools.cached_property):
+                        cached_properties[name] = value.func
+                seen.update(base_cls.__dict__)
+        else:
+            # `functools.cached_property` was introduced in 3.8.
+            cached_properties = {}
+
+        # Collect methods with a `__class__` reference that are shadowed in
+        # the new class.  To know to update them.
+        additional_closure_functions_to_update = []
+        if cached_properties:
+            # Slots that attrs itself created for cached properties on base
+            # classes may be reused; a collision with anything else (an
+            # attrs field or a user-defined slot) is a genuine conflict that
+            # must not be silently overridden.
+            reusable_slots = set()
+            for base_cls in self._cls.__mro__[1:-1]:
+                reusable_slots.update(
+                    getattr(base_cls, "__attrs_cached_properties__", ())
+                )
+
+            for name in cached_properties:
+                if name in self._attr_names:
+                    msg = (
+                        f"cached_property {name!r} conflicts with an attrs "
+                        "attribute of the same name."
+                    )
+                    raise ValueError(msg)
+                if name in existing_slots and name not in reusable_slots:
+                    msg = (
+                        f"cached_property {name!r} conflicts with an "
+                        "existing slot of the same name."
+                    )
+                    raise ValueError(msg)
+
+            class_annotations = _get_annotations(self._cls)
+            for name, func in cached_properties.items():
+                # Add cached properties to names for slotting.
+                names += (name,)
+                # Clear out the descriptor from the class to avoid clashing
+                # with the slot of the same name.  Inherited descriptors are
+                # shadowed by the slot and don't need to be removed.
+                cd.pop(name, None)
+                additional_closure_functions_to_update.append(func)
+                annotation = inspect.signature(func).return_annotation
+                if annotation is not inspect.Parameter.empty:
+                    class_annotations[name] = annotation
+
+            if class_annotations:
+                # If the class has no own annotations, _get_annotations
+                # returns a fresh dict; attach it so the inferred return
+                # annotations are preserved on the new class.
+                cd["__annotations__"] = class_annotations
+
+            original_getattr = cd.get("__getattr__")
+            if original_getattr is not None:
+                additional_closure_functions_to_update.append(original_getattr)
+
+            cd["__getattr__"] = _make_cached_property_getattr(
+                cached_properties, original_getattr, self._cls
+            )
+            # Remember which slots belong to cached properties, so
+            # subclasses can tell them apart from user-defined slots.
+            cd["__attrs_cached_properties__"] = tuple(cached_properties)
+
         # We only add the names of attributes that aren't inherited.
         # Setting __slots__ to inherited attributes wastes memory.
         slot_names = [name for name in names if name not in base_names]
@@ -886,7 +1041,10 @@ class _ClassBuilder:
         # compiler will bake a reference to the class in the method itself
         # as `method.__closure__`.  Since we replace the class with a
         # clone, we rewrite these references so it keeps working.
-        for item in cls.__dict__.values():
+        for item in (
+            *cls.__dict__.values(),
+            *additional_closure_functions_to_update,
+        ):
             if isinstance(item, (classmethod, staticmethod)):
                 # Class- and staticmethods hide their functions inside.
                 # These might need to be rewritten as well.

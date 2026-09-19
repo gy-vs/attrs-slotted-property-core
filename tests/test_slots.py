@@ -4,6 +4,7 @@
 Unit tests for slots-related functionality.
 """
 
+import functools
 import pickle
 import weakref
 
@@ -13,7 +14,7 @@ import pytest
 
 import attr
 
-from attr._compat import PYPY
+from attr._compat import PY_3_8_PLUS, PYPY
 
 
 # Pympler doesn't work on PyPy.
@@ -786,3 +787,708 @@ def test_slots_unpickle_is_backward_compatible(frozen):
     a_unpickled = pickle.loads(a_pickled)
 
     assert a_unpickled == a
+
+
+if PY_3_8_PLUS:
+
+    @attr.s(slots=True)
+    class CachedPropertyPickle:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x * 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_allows_call():
+    """
+    cached_property in slotted class allows call.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    assert A(11).f == 11
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_class_does_not_have__dict__():
+    """
+    slotted class with cached property has no __dict__ attribute.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    assert set(A.__slots__) == {"x", "f", "__weakref__"}
+    assert "__dict__" not in dir(A)
+    assert A.__attrs_cached_properties__ == ("f",)
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_works_on_frozen_instances():
+    """
+    cached_property works on frozen instances.
+    """
+
+    @attr.frozen(slots=True)
+    class A:
+        x: int
+
+        @functools.cached_property
+        def f(self) -> int:
+            return self.x
+
+    assert A(x=1).f == 1
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_infers_type():
+    """
+    Infers type of cached property.
+    """
+
+    @attr.frozen(slots=True)
+    class A:
+        x: int
+
+        @functools.cached_property
+        def f(self) -> int:
+            return self.x
+
+    assert A.__annotations__ == {"x": int, "f": int}
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_infers_type_without_own_annotations():
+    """
+    The return type of a cached property is preserved even if the class
+    doesn't have annotations of its own.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self) -> int:
+            return self.x
+
+    assert A.__annotations__ == {"f": int}
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_with_empty_getattr_raises_attribute_error_of_requested():
+    """
+    Ensures error information is not lost.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    a = A(1)
+    with pytest.raises(
+        AttributeError, match="'A' object has no attribute 'z'"
+    ):
+        a.z
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_raising_attributeerror():
+    """
+    Ensures AttributeError raised by a property is preserved by __getattr__()
+    implementation.
+
+    Regression test for issue https://github.com/python-attrs/attrs/issues/1230
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.p
+
+        @property
+        def p(self):
+            raise AttributeError("I am a property")
+
+        @functools.cached_property
+        def g(self):
+            return self.q
+
+        @property
+        def q(self):
+            return 2
+
+    a = A(1)
+    with pytest.raises(AttributeError, match=r"^I am a property$"):
+        a.p
+    with pytest.raises(AttributeError, match=r"^I am a property$"):
+        a.f
+
+    assert a.g == 2
+    assert a.q == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_error_is_not_cached():
+    """
+    If the cached property raises, nothing is cached and the next access
+    computes again.
+    """
+    calls = []
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return self.x
+
+    a = A(1)
+    with pytest.raises(RuntimeError, match="boom"):
+        a.f
+
+    assert a.f == 1
+    assert a.f == 1
+    assert len(calls) == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_with_getattr_calls_getattr_for_missing_attributes():
+    """
+    Ensure __getattr__ implementation is maintained for non cached_properties.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+        def __getattr__(self, item):
+            return item
+
+    a = A(1)
+    assert a.f == 1
+    assert a.z == "z"
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_getattr_in_superclass__is_called_for_missing_attributes_when_cached_property_present():
+    """
+    Ensure __getattr__ implementation is maintained in subclass.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        def __getattr__(self, item):
+            return item
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    b = B(1)
+    assert b.f == 1
+    assert b.z == "z"
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_getattr_in_subclass_gets_superclass_cached_property():
+    """
+    Ensure super() in __getattr__ is not broken through cached_property re-write.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+        def __getattr__(self, item):
+            return item
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def g(self):
+            return self.x
+
+        def __getattr__(self, item):
+            return super().__getattr__(item)
+
+    b = B(1)
+    assert b.f == 1
+    assert b.z == "z"
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_sub_class_with_independent_cached_properties_both_work():
+    """
+    Subclassing shouldn't break cached properties.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def g(self):
+            return self.x * 2
+
+    assert B(1).f == 1
+    assert B(1).g == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_with_multiple_cached_property_subclasses_works():
+    """
+    Multiple sub-classes shouldn't break cached properties.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib(kw_only=True)
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    @attr.s(slots=False)
+    class B:
+        @functools.cached_property
+        def g(self):
+            return self.x * 2
+
+        def __getattr__(self, item):
+            if hasattr(super(), "__getattr__"):
+                return super().__getattr__(item)
+            return item
+
+    @attr.s(slots=True)
+    class AB(A, B):
+        pass
+
+    ab = AB(x=1)
+
+    assert ab.f == 1
+    assert ab.g == 2
+    assert ab.h == "h"
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slotted_cached_property_can_access_super():
+    """
+    Cached properties can use super().
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib(kw_only=True)
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def f(self):
+            return super().x * 2
+
+    assert B(x=1).f == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_sub_class_avoids_duplicated_slots():
+    """
+    Duplicating the slots is a waste of memory.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def f(self):
+            return self.x * 2
+
+    assert B(1).f == 2
+    assert B.__slots__ == ()
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_sub_class_with_actual_slot():
+    """
+    A sub-class can have an explicit attrs field that replaces a cached property.
+    """
+
+    @attr.s(slots=True)
+    class A:  # slots : (x, f)
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    @attr.s(slots=True)
+    class B(A):
+        f: int = attr.ib()
+
+    assert B(1, 2).f == 2
+    assert B.__slots__ == ()
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_is_not_called_at_construction():
+    """
+    A cached property function should only be called at property access point.
+    """
+    call_count = 0
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            nonlocal call_count
+            call_count += 1
+            return self.x
+
+    A(1)
+    assert call_count == 0
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_repeat_call_only_once():
+    """
+    A cached property function should be called only once, on repeated attribute access.
+    """
+    call_count = 0
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            nonlocal call_count
+            call_count += 1
+            return self.x
+
+    obj = A(1)
+    obj.f
+    obj.f
+    assert call_count == 1
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_called_independent_across_instances():
+    """
+    A cached property value should be specific to the given instance.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    obj_1 = A(1)
+    obj_2 = A(2)
+
+    assert obj_1.f == 1
+    assert obj_2.f == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_properties_work_independently():
+    """
+    Multiple cached properties should work independently.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f_1(self):
+            return self.x
+
+        @functools.cached_property
+        def f_2(self):
+            return self.x * 2
+
+    obj = A(1)
+
+    assert obj.f_1 == 1
+    assert obj.f_2 == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_on_slotted_non_attrs_base():
+    """
+    Cached properties on slotted base classes that aren't attrs classes are
+    transformed too, so instances don't gain a __dict__.
+    """
+
+    class Base:
+        __slots__ = ()
+
+        @functools.cached_property
+        def f(self) -> int:
+            return 42
+
+    @attr.s(slots=True)
+    class A(Base):
+        x = attr.ib()
+
+    a = A(1)
+
+    assert a.f == 42
+    assert "__dict__" not in dir(a)
+    assert set(A.__slots__) == {"x", "f", "__weakref__"}
+    # The return annotation of inherited cached properties is kept too.
+    assert A.__annotations__ == {"f": int}
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_on_non_attrs_base_can_be_overridden():
+    """
+    A cached property on a non-attrs base class can be overridden by the
+    attrs class itself and by its subclasses.
+    """
+
+    class Base:
+        __slots__ = ()
+
+        @functools.cached_property
+        def f(self):
+            return 1
+
+    @attr.s(slots=True)
+    class A(Base):
+        x = attr.ib()
+
+    @attr.s(slots=True)
+    class B(A):
+        @functools.cached_property
+        def f(self):
+            return 2
+
+    assert A(1).f == 1
+    assert B(1).f == 2
+    assert B.__slots__ == ()
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_on_non_attrs_grand_base():
+    """
+    Cached properties are collected along the whole inheritance chain and
+    their slots are reused, not duplicated.
+    """
+
+    class GrandBase:
+        __slots__ = ()
+
+        @functools.cached_property
+        def f(self):
+            return 1
+
+    @attr.s(slots=True)
+    class Middle(GrandBase):
+        x = attr.ib()
+
+    @attr.s(slots=True)
+    class Leaf(Middle):
+        y = attr.ib()
+
+    leaf = Leaf(1, 2)
+
+    assert leaf.f == 1
+    assert Leaf.__slots__ == ("y",)
+    assert set(Middle.__slots__) == {"x", "f", "__weakref__"}
+    assert "__dict__" not in dir(leaf)
+    assert weakref.ref(leaf)() is leaf
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_conflicts_with_inherited_field():
+    """
+    A cached property whose name collides with an inherited attrs field
+    raises a clear error instead of silently hijacking the field's slot.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+    with pytest.raises(
+        ValueError, match="cached_property 'x' conflicts with an attrs"
+    ):
+
+        @attr.s(slots=True)
+        class B(A):
+            @functools.cached_property
+            def x(self):
+                return 1
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_conflicts_with_own_field():
+    """
+    A cached property whose name collides with an attrs field defined via
+    *these* raises a clear error.
+    """
+
+    with pytest.raises(
+        ValueError, match="cached_property 'x' conflicts with an attrs"
+    ):
+
+        @attr.s(these={"x": attr.ib()}, slots=True)
+        class A:
+            @functools.cached_property
+            def x(self):
+                return 1
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_conflicts_with_explicit_slot():
+    """
+    A cached property whose name collides with an explicit slot on a base
+    class raises a clear error instead of silently reusing the slot.
+    """
+
+    class Base:
+        __slots__ = ("f",)
+
+    with pytest.raises(
+        ValueError, match="cached_property 'f' conflicts with an existing slot"
+    ):
+
+        @attr.s(slots=True)
+        class A(Base):
+            @functools.cached_property
+            def f(self):
+                return 1
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_does_not_break_weakref():
+    """
+    weakref_slot keeps working in the presence of cached properties.
+    """
+
+    @attr.s(slots=True)
+    class A:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    a = A(1)
+    assert weakref.ref(a)() is a
+    assert set(A.__slots__) == {"x", "f", "__weakref__"}
+
+    @attr.s(slots=True, weakref_slot=False)
+    class B:
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x
+
+    b = B(1)
+    assert b.f == 1
+    assert set(B.__slots__) == {"x", "f"}
+    with pytest.raises(TypeError):
+        weakref.ref(b)
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_pickles():
+    """
+    Slotted classes with cached properties can be pickled; the cache itself
+    is not serialized and is recomputed on first access.
+    """
+    inst = CachedPropertyPickle(1)
+    assert inst.f == 2
+
+    new_inst = pickle.loads(pickle.dumps(inst))
+
+    assert new_inst.x == 1
+    assert new_inst.f == 2
+
+
+@pytest.mark.skipif(not PY_3_8_PLUS, reason="cached_property is 3.8+")
+def test_slots_cached_property_on_exception_classes():
+    """
+    Cached properties work on slotted exception classes, including frozen
+    ones that are raised (which mutates __traceback__ internally).
+    """
+
+    @attr.s(auto_exc=True, slots=True)
+    class MyError(Exception):
+        x = attr.ib()
+
+        @functools.cached_property
+        def f(self):
+            return self.x * 2
+
+    assert MyError(1).f == 2
+
+    @attr.frozen(auto_exc=True)
+    class MyFrozenError(Exception):
+        x: int
+
+        @functools.cached_property
+        def f(self) -> int:
+            return self.x * 2
+
+    with pytest.raises(MyFrozenError) as ei:
+        raise MyFrozenError(1)
+
+    assert ei.value.f == 2

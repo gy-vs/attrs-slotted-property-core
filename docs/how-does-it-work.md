@@ -96,3 +96,24 @@ Pick what's more important to you.
 You should avoid instantiating lots of frozen slotted classes (i.e. `@frozen`) in performance-critical code.
 
 Frozen dict classes have barely a performance impact, unfrozen slotted classes are even *faster* than unfrozen dict classes (i.e. regular classes).
+
+
+(how-slotted-cached_property)=
+
+## Cached Properties on Slotted Classes.
+
+By default, the standard library `functools.cached_property` decorator does not work on slotted classes,
+because it requires a `__dict__` to store the cached value.
+This could be surprising when using *attrs*, as it makes using slotted classes so easy,
+so *attrs* converts `functools.cached_property` decorated methods -- on the class itself and inherited from base classes -- when constructing slotted classes.
+
+Getting this working is achieved by:
+* Adding names to `__slots__` for the wrapped methods.
+* Adding a `__getattr__` method that computes and caches the values on first access (using `object.__setattr__`, so it works on frozen classes too).
+
+For most users this should mean that it works transparently.
+If the name of a cached property collides with an *attrs* field or an explicit slot, a `ValueError` is raised instead of silently overriding it.
+
+Note that the implementation does not guarantee that the wrapped method is called
+only once in multi-threaded usage.  This matches the implementation of `cached_property`
+in Python 3.12.
